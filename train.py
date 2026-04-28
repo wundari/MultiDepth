@@ -2,6 +2,7 @@
 import torch
 import torch.nn as nn
 
+from multiprocessing import freeze_support
 from pathlib import Path
 from time import perf_counter
 
@@ -19,22 +20,11 @@ from training.stages import (
     summarize_trainable_parameters,
 )
 from training.optim import OptimizerConfig, build_optimizer, build_scheduler
-from training.checkpoint import save_checkpoint
+from training.checkpoint import load_checkpoint, save_checkpoint
 
 from losses.confidence import sequence_l1_with_confidence_loss
 
 from config.cfg_train import TrainConfig
-
-# %%
-train_config = TrainConfig()
-
-loader = build_training_dataloader(
-    root=train_config.root,
-    batch_size=train_config.batch_size,
-    num_workers=train_config.num_workers,
-    crop_size=train_config.crop_size,
-    use_mask_as_valid=train_config.use_mask_as_valid,
-)
 
 
 def build_model(backend: str) -> RAFTStereoMonoBetaVLMFluxCore:
@@ -47,36 +37,6 @@ def build_model(backend: str) -> RAFTStereoMonoBetaVLMFluxCore:
     return RAFTStereoMonoBetaVLMFluxCore(model_cfg)
 
 
-device = torch.device("cuda") if torch.cuda.is_available() else torch.device("mps")
-backend = "mock"
-model = build_model(backend).to(device)
-stage = StagePreset.by_name("vlm_adapters")
-stage_report = apply_training_stage(model, stage)
-summary = summarize_trainable_parameters(model)
-print(f"Stage: {stage.name}")
-print(f"LoRA targets: {len(stage_report['lora_targets'])}")
-print(f"Trainable params: {summary['trainable']} / {summary['total']}")
-
-optim_cfg = OptimizerConfig(
-    lr=stage.base_lr,
-    weight_decay=stage.weight_decay,
-    warmup_steps=train_config.warmup_steps,
-    total_steps=train_config.max_steps,
-)
-
-optimizer = build_optimizer(
-    model,
-    lr=optim_cfg.lr,
-    weight_decay=optim_cfg.weight_decay,
-    lr_multipliers=stage.lr_multipliers,
-    betas=optim_cfg.betas,
-    eps=optim_cfg.eps,
-)
-
-scheduler = build_scheduler(optimizer, optim_cfg)
-scaler = torch.amp.GradScaler(device.type)
-
-
 def train_one_epoch(
     model: nn.Module,
     loader,
@@ -84,16 +44,17 @@ def train_one_epoch(
     scheduler,
     scaler: torch.cuda.amp.GradScaler,
     config: TrainConfig,
+    device: torch.device,
     epoch: int = 0,
     start_step: int = 0,
     stage_name: str = "",
 ) -> tuple[int, dict[str, float]]:
 
-    device = torch.device(config.device)
-
     model.train()
 
     metrics: dict[str, float] = {}
+    log_totals: dict[str, float] = {}
+    log_count = 0
     step = start_step
     last_log = perf_counter()
 
@@ -102,17 +63,17 @@ def train_one_epoch(
         if step >= config.max_steps:
             break
 
-        # batch = next(iter(loader))
-        left = batch["left"].to(device)
-        right = batch["right"].to(device)
-        target = batch["target_flow"].to(device)
-        valid = batch["valid"].to(device)
+        left = batch["left"].to(device, non_blocking=True)
+        right = batch["right"].to(device, non_blocking=True)
+        target = batch["target_flow"].to(device, non_blocking=True)
+        valid = batch["valid"].to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-        # autocast_enabled = config.amp and device.type == "cuda"
+        use_amp = config.amp and device.type == "cuda"
         with torch.autocast(
             device_type=device.type,
             dtype=torch.bfloat16,
+            enabled=use_amp,
         ):
             outputs = model(left, right)
             loss, batch_metrics = sequence_l1_with_confidence_loss(
@@ -129,17 +90,29 @@ def train_one_epoch(
         step += 1
         metrics = {**batch_metrics}
         metrics["lr"] = optimizer.param_groups[0]["lr"]
+        for key, value in batch_metrics.items():
+            log_totals[key] = log_totals.get(key, 0.0) + float(value)
+        log_count += 1
 
         if step % config.log_every == 0:
             now = perf_counter()
-            metrics["iter_time_sec"] = (now - last_log) / float(config.log_every)
+            avg_metrics = {
+                key: value / max(log_count, 1) for key, value in log_totals.items()
+            }
+            metrics.update({f"avg_{key}": value for key, value in avg_metrics.items()})
+            metrics["iter_time_sec"] = (now - last_log) / float(max(log_count, 1))
             last_log = now
+            log_totals.clear()
+            log_count = 0
 
             print(
                 f"[epoch {epoch:03d} step {step:06d}] "
-                f"loss={metrics['loss']:.4f} flow={metrics['flow_loss']:.4f} "
-                f"conf={metrics['confidence_loss']:.4f} "
-                f"epe={metrics['epe']:.4f} lr={metrics['lr']:.2e}"
+                f"loss={avg_metrics['loss']:.4f} flow={avg_metrics['flow_loss']:.4f} "
+                f"conf={avg_metrics['confidence_loss']:.4f} "
+                f"epe={avg_metrics['epe']:.4f} "
+                f"valid={avg_metrics['valid_fraction']:.3f} "
+                f"target={avg_metrics['target_abs_mean']:.1f} "
+                f"lr={metrics['lr']:.2e}"
             )
 
         if step % config.save_every == 0:
@@ -159,220 +132,111 @@ def train_one_epoch(
     return step, metrics
 
 
-step, metrics = train_one_epoch(
-    model, loader, optimizer, scheduler, scaler, train_config
-)
-# %%
-from utils.geometry import normalize_uint8_image, make_coords_grid
-from utils.schedules import modulation_weight
-from models.stereo.corr import CorrelationPyramid1D
+def main() -> int:
+    train_config = TrainConfig()
 
-from models.priors.beta_modulator import (
-    BetaModulator,
-    BetaModulatorConfig,
-    BetaModulationOutput,
-)
-from models.stereo.upsample import upsample_flow
-
-batch = next(iter(loader))
-left = batch["left"].to(device)
-right = batch["right"].to(device)
-target = batch["target_flow"].to(device)
-valid = batch["valid"].to(device)
-left_norm = normalize_uint8_image(left)  # convert pix val from [0.0, 255.0] to [-1, 1]
-right_norm = normalize_uint8_image(right)
-fmap_left, fmap_right = model.feature_encoder([left_norm, right_norm])
-model._validate_downsample_ratio(left, fmap_left)
-
-mono = model.mono(left)
-depth_lowres = mono.inverse_depth
-mono_features = mono.penultimate
-if depth_lowres.shape[-2:] != fmap_left.shape[-2:]:
-    depth_lowres = F.interpolate(
-        depth_lowres,
-        size=fmap_left.shape[-2:],
-        mode="bilinear",
-        align_corners=False,
-    )
-if mono_features.shape[-2:] != fmap_left.shape[-2:]:
-    mono_features = F.interpolate(
-        mono_features,
-        size=fmap_left.shape[-2:],
-        mode="bilinear",
-        align_corners=False,
+    loader = build_training_dataloader(
+        root=train_config.root,
+        batch_size=train_config.batch_size,
+        num_workers=train_config.num_workers,
+        crop_size=train_config.crop_size,
+        use_mask_as_valid=train_config.use_mask_as_valid,
     )
 
-context_outputs = model.context_adapter(mono_features)
-hidden_states, contexts = model._split_context_outputs(context_outputs)
-context_gates = model.update_block.prepare_contexts(contexts)
+    device = torch.device(train_config.device)
+    model = build_model(train_config.backend).to(device)
+    stage = StagePreset.by_name(train_config.stage)
+    if stage.name == "vlm_adapters" and train_config.restore is None:
+        raise ValueError(
+            "stage='vlm_adapters' freezes the geometry stack and requires "
+            "TrainConfig.restore to point at a pretrained checkpoint. Use "
+            "stage='scratch_finetune' when training this mock-backed model from scratch."
+        )
+    stage_report = apply_training_stage(model, stage)
+    summary = summarize_trainable_parameters(model)
+    print(f"Stage: {stage.name}")
+    print(f"LoRA targets: {len(stage_report['lora_targets'])}")
+    print(f"Trainable params: {summary['trainable']} / {summary['total']}")
 
-batch, _, h_low, w_low = fmap_left.shape
-coords0 = make_coords_grid(
-    batch, h_low, w_low, device=fmap_left.device, dtype=fmap_left.dtype
-)
-coords1 = coords0.clone()
-
-corr_pyramid = CorrelationPyramid1D(
-    fmap_left,
-    fmap_right,
-    num_levels=model.config.corr_levels,
-    radius=model.config.corr_radius,
-)
-
-disp_predictions: list[torch.Tensor] = []
-modulation_predictions: list[torch.Tensor] = []
-beta_out: BetaModulationOutput | None = None
-up_mask = None
-
-num_iters = model.config.iters
-for iteration in range(num_iters):
-    # iteration = 0
-    coords1 = coords1.detach()
-    corr = corr_pyramid.sample(coords1)
-    flow = coords1 - coords0
-
-    disp_lbp = model.lbp(flow[:, :1])
-    depth_lbp = model.lbp(depth_lowres)
-    beta_out = model.beta_modulator(disp_lbp, depth_lbp, return_distribution=True)
-    modulation_predictions.append(beta_out.modulation)
-
-    update_32 = (iteration % model.config.update_32_every) == 0
-    update_16 = (iteration % model.config.update_16_every) == 0 or update_32
-    hidden_states, up_mask, delta_flow = model.update_block(
-        hidden_states,
-        context_gates,
-        corr,
-        flow,
-        update_8=True,
-        update_16=update_16,
-        update_32=update_32,
+    optim_cfg = OptimizerConfig(
+        lr=stage.base_lr,
+        weight_decay=stage.weight_decay,
+        warmup_steps=train_config.warmup_steps,
+        total_steps=train_config.max_steps,
     )
 
-    weight = modulation_weight(
-        iteration,
-        num_iters,
-        mode=model.config.modulation_schedule,
-        ratio=model.config.modulation_ratio,
-    )
-    delta_flow_x = delta_flow[:, :1] * (1.0 + beta_out.modulation * weight)
-    delta_flow = torch.cat([delta_flow_x, torch.zeros_like(delta_flow[:, 1:2])], dim=1)
-    coords1 = coords1 + delta_flow
-
-    flow_lowres = coords1 - coords0
-    fullres_flow = upsample_flow(
-        flow_lowres,
-        factor=model.config.downsample_factor,
-        mask_logits=up_mask if model.config.use_convex_upsampling else None,
-    )
-    disp_predictions.append(fullres_flow[:, :1])
-
-corr = corr_pyramid.sample(coords1.detach())
-disp_positive = -(coords1 - coords0)[:, :1]
-prompt = None
-refine_out = model.refinement(
-    left_norm,
-    disp_positive,
-    depth_lowres,
-    hidden_states[0],
-    corr,
-    beta_distribution=beta_out.distribution,
-    prompt=prompt,
-)
-
-# %% debugging model.refinement
-prompt = prompt if prompt is not None else self.prompt_builder.build().full_text
-
-refine_out = model.refinement(
-    left_rgb=left_norm,
-    disp=disp_positive,
-    depth=depth_lowres,
-    hidden=hidden_states[0],
-    cost_volume=corr,
-    beta_distribution=beta_out.distribution,
-    prompt=prompt,
-)
-# model.refinement
-stereo_disp = disp_positive
-cost_volume = corr
-mono_disp = depth_lowres
-hidden = hidden_states[0]
-beta_distribution = beta_out.distribution
-confidence_logits, confidence, vlm_aux = model.refinement.confidence_head(
-    left_rgb=left_norm,
-    cost_volume=corr,
-    stereo_disp=disp_positive,
-    mono_disp=depth_lowres,
-    hidden=hidden_states[0],
-    beta_distribution=beta_out.distribution,
-    prompt=prompt,
-)
-
-# model.refinement.confidence_head
-qwen_out = model.refinement.confidence_head.qwen(
-    left_norm,
-    prompt=prompt,
-)
-
-qwen_spatial = qwen_out.spatial
-if qwen_spatial.shape[-2:] != stereo_disp.shape[-2:]:
-    qwen_spatial = F.interpolate(
-        qwen_spatial,
-        size=stereo_disp.shape[-2:],
-        mode="bilinear",
-        align_corners=False,
+    optimizer = build_optimizer(
+        model,
+        lr=optim_cfg.lr,
+        weight_decay=optim_cfg.weight_decay,
+        lr_multipliers=stage.lr_multipliers,
+        betas=optim_cfg.betas,
+        eps=optim_cfg.eps,
     )
 
-latent_inputs = [cost_volume, stereo_disp, mono_disp]
-if model.refinement.config.use_hidden_features and hidden is not None:
-    latent_inputs.append(hidden)
+    scheduler = build_scheduler(optimizer, optim_cfg)
+    scaler = torch.amp.GradScaler(
+        device.type,
+        enabled=train_config.amp and device.type == "cuda",
+    )
 
-if model.refinement.config.use_beta_statistics and beta_distribution is not None:
-    latent_inputs.extend([beta_distribution.mean, beta_distribution.variance])
+    start_epoch = 0
+    start_step = 0
+    if train_config.restore is not None:
+        restore_info = load_checkpoint(
+            train_config.restore,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            strict=train_config.strict_load,
+        )
+        start_epoch = restore_info["epoch"]
+        start_step = restore_info["step"]
+        print(f"Loaded checkpoint: {train_config.restore}")
+        print(
+            f"Missing keys: {len(restore_info['missing_keys'])}, "
+            f"unexpected keys: {len(restore_info['unexpected_keys'])}"
+        )
 
-latent_inputs = torch.cat(latent_inputs, dim=1)
-logits, confidence = model.refinement.confidence_head.decoder(
-    latent_inputs, qwen_out.tokens, qwen_out.prompt_embedding
-)
+    step = start_step
+    epoch = start_epoch
+    metrics: dict[str, float] = {}
+    while step < train_config.max_steps:
+        previous_step = step
+        step, metrics = train_one_epoch(
+            model,
+            loader,
+            optimizer,
+            scheduler,
+            scaler,
+            train_config,
+            device,
+            epoch=epoch,
+            start_step=step,
+            stage_name=stage.name,
+        )
+        if step == previous_step:
+            break
+        epoch += 1
 
-# model.refinement.confidence_head.decoder
-qwen_tokens = qwen_out.tokens
-qwen_prompt_embedding = qwen_out.prompt_embedding
-latent = (
-    model.refinement.confidence_head.decoder.latent_proj(latent_inputs)
-    .flatten(2)
-    .transpose(1, 2)
-)  # [B, HW, D]
-
-cond_prompt = qwen_prompt_embedding.unsqueeze(1)
-cond = torch.cat(
-    [
-        model.refinement.confidence_head.decoder.cond_proj(qwen_tokens),
-        model.refinement.confidence_head.decoder.cond_proj(cond_prompt),
-    ],
-    dim=1,
-)
-
-for block in model.refinement.confidence_head.decoder.blocks:
-    latent = block(latent, cond)
+    save_checkpoint(
+        Path(train_config.output_dir) / "checkpoint_last.pt",
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        epoch=epoch,
+        step=step,
+        stage_name=stage.name,
+        metrics=metrics,
+    )
+    return 0
 
 
-latent = self.out_norm(latent)
-latent_map = latent.transpose(1, 2).reshape(B, -1, H, W)
-logits = self.out_head(latent_map)
-confidence = torch.sigmoid(logits)
+if __name__ == "__main__":
+    freeze_support()
+    raise SystemExit(main())
 
 
 # %%
-
-depth_registered_neg_up = upsample_flow(
-    -refine_out.depth_registered,
-    factor=self.config.downsample_factor,
-    mask_logits=(refine_out.up_mask if self.config.use_convex_upsampling else None),
-)
-fused_neg_up = upsample_flow(
-    -refine_out.fused_disp,
-    factor=self.config.downsample_factor,
-    mask_logits=(refine_out.up_mask if self.config.use_convex_upsampling else None),
-)
-disp_predictions.append(depth_registered_neg_up)
-disp_predictions.append(fused_neg_up)
